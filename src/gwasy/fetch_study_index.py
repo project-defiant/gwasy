@@ -8,6 +8,12 @@ import logging
 from urllib.parse import urlparse, ParseResult
 import io
 import gzip
+from typing import Callable, Sequence, TypeVar
+from polars.expr.whenthen import ChainedThen
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+T = TypeVar("T")
 
 
 class StudyIndexSchema(Enum):
@@ -45,6 +51,8 @@ class StudyIndex:
 class Sumstat:
     def __init__(self, df: pl.LazyFrame):
         self.df = df
+        self.columns = self.df.collect_schema().names()
+        self.dtypes = self.df.collect_schema().dtypes()
 
     @classmethod
     def from_catalog_sumstat(cls, uri: str, path) -> Sumstat:
@@ -59,6 +67,73 @@ class Sumstat:
 
             case _:
                 raise ValueError("Incorrect uri to download summary statistics.")
+
+    def manhattan(self) -> Sumstat:
+        """Plot manhattan."""
+        # make the order of variants correct
+        self = self.drop_nullable_variants().sort().neglog_pvalue()
+        data = self.df.select("base_pair_location", "neglog_pval", "chromosome").collect()
+        sns.scatterplot(data=data, x="base_pair_location", y="neglog_pval", hue="chromosome")
+        plt.show()
+        return self
+
+    def neglog_pvalue(self) -> Sumstat:
+        """Add negative logarithm of p-value"""
+        self.df = self.df.with_columns(neglog_pval=-1 * pl.col("p_value").log10())
+        return self
+
+    def drop_nullable_variants(self) -> Sumstat:
+        # variant_field = "hm_variant_id" if "hm_variant_id" in self.columns else "variant_id"
+        print(self.df.collect())
+        self.df = self.df.filter(pl.col("rsid").is_not_null())
+        return self
+
+    def sort(self) -> Sumstat:
+        if "chromosome" in self.columns:
+            col_idx = self.columns.index("chromosome")
+            if self.dtypes[col_idx] == pl.String():
+                logging.info("Sorting by `chromosome`")
+
+                def reduce_expression(
+                    callable: Callable[[T, ChainedThen], ChainedThen],
+                    initial_expression: ChainedThen,
+                    collection: Sequence[T],
+                ) -> pl.ChainedThen:
+                    """Reduce initial expression."""
+                    expression = initial_expression
+                    for c in collection:
+                        expression = callable(c, expression)
+
+                    return expression
+
+                def map_chromosomes(col: pl.Column) -> pl.Column:
+                    """Map chromosomes to chromosome order."""
+                    chromosomes = [str(c) for c in range(1, 23)] + ["X", "Y", "MT"]
+                    order = {c: idx + 1 for idx, c in enumerate(chromosomes)}
+                    expression = pl.when(col == chromosomes[0]).then(pl.lit(order[chromosomes[0]]))
+                    initial_expression = pl.when(col == chromosomes[0]).then(order[chromosomes[0]])
+
+                    def _then(c: str, e: ChainedThen) -> ChainedThen:
+                        return e.when(col == c).then(pl.lit(order[c]))
+
+                    expression = reduce_expression(
+                        callable=_then,
+                        initial_expression=initial_expression,  # type: ignore
+                        collection=chromosomes[1:],
+                    )
+
+                    return expression
+
+                self.df = self.df.with_columns(order=map_chromosomes(pl.col("chromosome"))).sort(
+                    by=[pl.col("order"), pl.col("position")]
+                )
+            else:
+                self.df = self.df.sort(by=[pl.col("chromosome"), pl.col("base_pair_location")])
+        if "hm_chrom" in self.columns:
+            logging.info("Sorting by `hm_chrom`")
+            self.df = self.df.sort(by=[pl.col("hm_chrom"), pl.col("hm_pos")])
+
+        return self
 
 
 def cache_sumstat(uri: ParseResult, tmp_path: str, study: str) -> pl.LazyFrame:

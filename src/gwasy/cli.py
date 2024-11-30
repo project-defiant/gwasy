@@ -9,7 +9,7 @@ def _main(
     study: str, path: str = "gwas-catalog-v1.0.3.1-studies-r2024-11-20.tsv", tmp_path: str = "/tmp/catalog/sumstat"
 ) -> None:
     sumstats = StudyIndex.from_catalog_studies(path).get_sumstat(study, tmp_path)
-    print(sumstats.df.collect())
+    print(sumstats.manhattan())
 
 
 def main():
